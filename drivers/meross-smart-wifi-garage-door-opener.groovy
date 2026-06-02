@@ -2,7 +2,7 @@
  * Meross Smart WiFi Garage Door Opener
  *
  * Author: Daniel Tijerina
- * Last updated: 2021-09-26
+ * Last updated: 2026-06-01 - patched for current Meross key-based signing and MSG100 channel 0
  *
  *
  * Licensed under the Apache License, Version 2.0 (the 'License'); you may not
@@ -62,20 +62,51 @@ def initialize() {
     runEvery5Minutes(refresh)
 }
 
+
+private Boolean settingPresent(value) {
+    if (value == null) return false
+    def s = value.toString().trim()
+    return s.length() > 0 && s.toUpperCase() != 'N/A'
+}
+
+private Boolean hasModernKeySigning() {
+    return settingPresent(settings.key)
+}
+
+private Boolean hasLegacySigning() {
+    return settingPresent(settings.messageId) && settingPresent(settings.sign) && settingPresent(settings.timestamp) && settings.timestamp.toString() != '0'
+}
+
+private Boolean hasMinimumConfig() {
+    return settingPresent(settings.deviceIp) && settingPresent(settings.uuid) && (hasModernKeySigning() || hasLegacySigning())
+}
+
+private def payloadSigningData() {
+    if (hasModernKeySigning()) {
+        return getSign()
+    }
+    return [MessageId: settings.messageId, Sign: settings.sign, CurrentTime: settings.timestamp]
+}
+
+private Integer configuredChannel() {
+    return settings.channel == null ? 0 : settings.channel.toInteger()
+}
+
+private void warnMissingConfig() {
+    sendEvent(name: 'door', value: 'unknown', isStateChange: false)
+    log.warn("missing setting configuration - deviceIp=${settingPresent(settings.deviceIp)}, uuid=${settingPresent(settings.uuid)}, key=${hasModernKeySigning()}, legacySigning=${hasLegacySigning()}, channel=${settings.channel}")
+}
+
 def sendCommand(int open) {
     
-    def currentVersion = device.currentState('version')?.value ? device.currentState('version')?.value.replace(".","").toInteger() : 0
-
-    // Firmware version 3.2.3 and greater require different data for request
-    if (!settings.deviceIp || !settings.uuid || (currentVersion >= 323 && !settings.key) || (currentVersion < 323 && (!settings.messageId || !settings.sign || !settings.timestamp))) {
-        sendEvent(name: 'door', value: 'unknown', isStateChange: false)
-        log.warn('missing setting configuration')
+    if (!hasMinimumConfig()) {
+        warnMissingConfig()
         return
     }
     sendEvent(name: 'door', value: open ? 'opening' : 'closing', isStateChange: true)
 
     try {
-        def payloadData = currentVersion >= 323 ? getSign() : [MessageId: settings.messageId, Sign: settings.sign, CurrentTime: settings.timestamp]
+        def payloadData = payloadSigningData()
         
         def hubAction = new hubitat.device.HubAction([
         method: 'POST',
@@ -84,7 +115,7 @@ def sendCommand(int open) {
             'HOST': settings.deviceIp,
             'Content-Type': 'application/json',
         ],
-        body: '{"payload":{"state":{"open":' + open + ',"channel":' + settings.channel + ',"uuid":"' + settings.uuid + '"}},"header":{"messageId":"'+payloadData.get('MessageId')+'","method":"SET","from":"http://'+settings.deviceIp+'/config","sign":"'+payloadData.get('Sign')+'","namespace":"Appliance.GarageDoor.State","triggerSrc":"AndroidLocal","timestamp":' + payloadData.get('CurrentTime') + ',"payloadVersion":1' + ',"uuid":"' + settings.uuid + '"}}'
+        body: '{"payload":{"state":{"open":' + open + ',"channel":' + configuredChannel() + ',"uuid":"' + settings.uuid + '"}},"header":{"messageId":"'+payloadData.get('MessageId')+'","method":"SET","from":"http://'+settings.deviceIp+'/config","sign":"'+payloadData.get('Sign')+'","namespace":"Appliance.GarageDoor.State","triggerSrc":"AndroidLocal","timestamp":' + payloadData.get('CurrentTime') + ',"payloadVersion":1' + ',"uuid":"' + settings.uuid + '"}}'
     ])
         runIn(settings.garageOpenCloseTime, "refresh")
         return hubAction
@@ -95,16 +126,12 @@ def sendCommand(int open) {
 
 
 def refresh() {
-    def currentVersion = device.currentState('version')?.value ? device.currentState('version')?.value.replace(".","").toInteger() : 0
-
-    // Firmware version 3.2.3 and greater require different data for request
-    if (!settings.deviceIp || !settings.uuid || (currentVersion >= 323 && !settings.key) || (currentVersion < 323 && (!settings.messageId || !settings.sign || !settings.timestamp))) {
-        sendEvent(name: 'door', value: 'unknown', isStateChange: false)
-        log.warn('missing setting configuration')
+    if (!hasMinimumConfig()) {
+        warnMissingConfig()
         return
     }
     try {
-        def payloadData = currentVersion >= 323 ? getSign() : [MessageId: settings.messageId, Sign: settings.sign, CurrentTime: settings.timestamp]
+        def payloadData = payloadSigningData()
 
         log.info('Refreshing')
         
@@ -152,7 +179,11 @@ def parse(String description) {
     if(body.header.method == "SETACK") return
     
     if (body.payload.all) {
-        def state = body.payload.all.digest.garageDoor[settings.channel.intValue() - 1].open
+        def doors = body.payload.all.digest.garageDoor
+        def idx = configuredChannel()
+        if (idx >= doors.size() && idx > 0) idx = idx - 1
+        if (idx < 0) idx = 0
+        def state = doors[idx].open
         sendEvent(name: 'door', value: state ? 'open' : 'closed')
         sendEvent(name: 'contact', value: state ? 'open' : 'closed')
         sendEvent(name: 'version', value: body.payload.all.system.firmware.version, isStateChange: false)
@@ -170,8 +201,8 @@ def getSign(int stringLength = 16){
     def randomString = new Random().with { (0..stringLength).collect { chars[ nextInt(chars.length() ) ] }.join()}    
     
     int currentTime = new Date().getTime() / 1000
-    messageId = MessageDigest.getInstance("MD5").digest((randomString + currentTime.toString()).bytes).encodeHex().toString()
-    sign = MessageDigest.getInstance("MD5").digest((messageId + settings.key + currentTime.toString()).bytes).encodeHex().toString()
+    def messageId = MessageDigest.getInstance("MD5").digest((randomString + currentTime.toString()).bytes).encodeHex().toString()
+    def sign = MessageDigest.getInstance("MD5").digest((messageId + settings.key + currentTime.toString()).bytes).encodeHex().toString()
     
     def requestData = [
          CurrentTime: currentTime,
