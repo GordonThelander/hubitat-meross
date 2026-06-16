@@ -2,8 +2,9 @@
  * Meross Smart WiFi Garage Door Opener
  *
  * Author: Daniel Tijerina
- * Last updated: 2021-09-26
+ * Last updated: 2026-06-16 - patched for robust scheduled polling, creation rename support, command follow-up status polling and Gordon Thelander modification attribution
  *
+ * Modified by Gordon Thelander.
  *
  * Licensed under the Apache License, Version 2.0 (the 'License'); you may not
  * use this file except in compliance with the License. You may obtain a copy
@@ -31,9 +32,12 @@ metadata {
         capability 'Actuator'
         capability 'ContactSensor'
         capability 'Refresh'
+        capability 'Polling'
+        capability 'Initialize'
 
         attribute 'model', 'string'
         attribute 'version', 'string'
+        attribute 'lastRefresh', 'string'
     }
     preferences {
         section('Device Selection') {
@@ -44,38 +48,171 @@ metadata {
             input('sign', 'text', title: 'Sign', description: '', required: true, defaultValue: '')
             input('uuid', 'text', title: 'UUID', description: '', required: true, defaultValue: '')
             input('channel', 'number', title: 'Garage Door Port', description: '', required: true, defaultValue: 1)
-            input('garageOpenCloseTime','number',title: 'Garage Open/Close time (in seconds)', description:'', required: true, defaultValue: 5)
+            input('openCommandPollDelaySeconds','number',title: 'Status poll after open command (seconds)', description:'Extra refresh after an open command is sent', required: true, defaultValue: 2)
+            input('closeCommandPollDelaySeconds','number',title: 'Status poll after close command (seconds)', description:'Extra refresh after a close command is sent', required: true, defaultValue: 20)
+            input('pollFrequencySeconds', 'enum', title: 'Polling frequency', description: 'How often Hubitat refreshes the garage door status from the Meross device', required: true, defaultValue: '60', options: ['0':'Disabled','15':'15 seconds','30':'30 seconds','60':'1 minute','120':'2 minutes','300':'5 minutes','600':'10 minutes','900':'15 minutes','1800':'30 minutes'])
             input('DebugLogging', 'bool', title: 'Enable debug logging', defaultValue: true)
         }
     }
 }
 
 def getDriverVersion() {
-    1
+    5
+}
+
+def installed() {
+    log.info('Installed')
+    initialize()
 }
 
 def initialize() {
     log 'Initializing Device'
+    unschedule('poll')
+    refresh()
+    schedulePolling()
+}
+
+private Integer getPollFrequencySeconds() {
+    try {
+        return (settings.pollFrequencySeconds ?: '60').toString().toInteger()
+    } catch (Exception e) {
+        return 60
+    }
+}
+
+private Integer getIntegerSetting(String settingName, Integer defaultValue) {
+    try {
+        def value = settings[settingName]
+        if(value == null || value.toString().trim().length() == 0) return defaultValue
+        return value.toString().toInteger()
+    } catch (Exception ignored) {
+        return defaultValue
+    }
+}
+
+private Integer getOpenCommandPollDelaySeconds() {
+    return getIntegerSetting('openCommandPollDelaySeconds', 2)
+}
+
+private Integer getCloseCommandPollDelaySeconds() {
+    return getIntegerSetting('closeCommandPollDelaySeconds', 20)
+}
+
+private void scheduleCommandFollowUpPoll(int open) {
+    Integer delay = (open == 1) ? getOpenCommandPollDelaySeconds() : getCloseCommandPollDelaySeconds()
+    String handlerName = (open == 1) ? 'refreshAfterOpenCommand' : 'refreshAfterCloseCommand'
+    String commandName = (open == 1) ? 'open' : 'close'
+
+    if(delay > 0) {
+        runIn(delay, handlerName, [overwrite: true])
+        log.info("Command follow-up status poll scheduled in ${delay} seconds after ${commandName} command")
+    }
+}
+
+def refreshAfterOpenCommand() {
+    log.info('Running follow-up status poll after open command')
+    refresh()
+}
+
+def refreshAfterCloseCommand() {
+    log.info('Running follow-up status poll after close command')
+    refresh()
+}
+
+private void schedulePolling() {
+    Integer seconds = getPollFrequencySeconds()
+    unschedule('poll')
+
+    if (seconds <= 0) {
+        state.pollScheduleMode = 'disabled'
+        log.info('Polling disabled')
+        return
+    }
+
+    // Use Hubitat's recurring scheduler for the 1 minute default so it appears as a proper scheduled job.
+    // Sub-minute intervals still use a runIn loop because Hubitat does not provide runEvery15Seconds/runEvery30Seconds helpers.
+    if (seconds == 60) {
+        state.pollScheduleMode = 'recurring'
+        runEvery1Minute('poll')
+        log.info('Polling scheduled every 1 minute using runEvery1Minute')
+    } else if (seconds == 300) {
+        state.pollScheduleMode = 'recurring'
+        runEvery5Minutes('poll')
+        log.info('Polling scheduled every 5 minutes using runEvery5Minutes')
+    } else if (seconds == 600) {
+        state.pollScheduleMode = 'recurring'
+        runEvery10Minutes('poll')
+        log.info('Polling scheduled every 10 minutes using runEvery10Minutes')
+    } else if (seconds == 900) {
+        state.pollScheduleMode = 'recurring'
+        runEvery15Minutes('poll')
+        log.info('Polling scheduled every 15 minutes using runEvery15Minutes')
+    } else if (seconds == 1800) {
+        state.pollScheduleMode = 'recurring'
+        runEvery30Minutes('poll')
+        log.info('Polling scheduled every 30 minutes using runEvery30Minutes')
+    } else {
+        state.pollScheduleMode = 'runIn'
+        runIn(seconds, 'poll', [overwrite: true])
+        log.info("Polling scheduled every ${seconds} seconds using runIn self-reschedule")
+    }
+}
+
+def poll() {
+    log.info('Polling Meross garage door status')
     refresh()
 
-    unschedule(refresh)
-    runEvery5Minutes(refresh)
+    // Only self-reschedule for custom/sub-minute intervals. Recurring Hubitat schedules keep themselves alive.
+    if ((state.pollScheduleMode ?: 'runIn') == 'runIn') {
+        schedulePolling()
+    }
+}
+
+
+private Boolean settingPresent(value) {
+    if (value == null) return false
+    def s = value.toString().trim()
+    return s.length() > 0 && s.toUpperCase() != 'N/A'
+}
+
+private Boolean hasModernKeySigning() {
+    return settingPresent(settings.key)
+}
+
+private Boolean hasLegacySigning() {
+    return settingPresent(settings.messageId) && settingPresent(settings.sign) && settingPresent(settings.timestamp) && settings.timestamp.toString() != '0'
+}
+
+private Boolean hasMinimumConfig() {
+    return settingPresent(settings.deviceIp) && settingPresent(settings.uuid) && (hasModernKeySigning() || hasLegacySigning())
+}
+
+private def payloadSigningData() {
+    if (hasModernKeySigning()) {
+        return getSign()
+    }
+    return [MessageId: settings.messageId, Sign: settings.sign, CurrentTime: settings.timestamp]
+}
+
+private Integer configuredChannel() {
+    return settings.channel == null ? 0 : settings.channel.toInteger()
+}
+
+private void warnMissingConfig() {
+    sendEvent(name: 'door', value: 'unknown', isStateChange: false)
+    log.warn("missing setting configuration - deviceIp=${settingPresent(settings.deviceIp)}, uuid=${settingPresent(settings.uuid)}, key=${hasModernKeySigning()}, legacySigning=${hasLegacySigning()}, channel=${settings.channel}")
 }
 
 def sendCommand(int open) {
     
-    def currentVersion = device.currentState('version')?.value ? device.currentState('version')?.value.replace(".","").toInteger() : 0
-
-    // Firmware version 3.2.3 and greater require different data for request
-    if (!settings.deviceIp || !settings.uuid || (currentVersion >= 323 && !settings.key) || (currentVersion < 323 && (!settings.messageId || !settings.sign || !settings.timestamp))) {
-        sendEvent(name: 'door', value: 'unknown', isStateChange: false)
-        log.warn('missing setting configuration')
+    if (!hasMinimumConfig()) {
+        warnMissingConfig()
         return
     }
     sendEvent(name: 'door', value: open ? 'opening' : 'closing', isStateChange: true)
 
     try {
-        def payloadData = currentVersion >= 323 ? getSign() : [MessageId: settings.messageId, Sign: settings.sign, CurrentTime: settings.timestamp]
+        def payloadData = payloadSigningData()
         
         def hubAction = new hubitat.device.HubAction([
         method: 'POST',
@@ -84,9 +221,9 @@ def sendCommand(int open) {
             'HOST': settings.deviceIp,
             'Content-Type': 'application/json',
         ],
-        body: '{"payload":{"state":{"open":' + open + ',"channel":' + settings.channel + ',"uuid":"' + settings.uuid + '"}},"header":{"messageId":"'+payloadData.get('MessageId')+'","method":"SET","from":"http://'+settings.deviceIp+'/config","sign":"'+payloadData.get('Sign')+'","namespace":"Appliance.GarageDoor.State","triggerSrc":"AndroidLocal","timestamp":' + payloadData.get('CurrentTime') + ',"payloadVersion":1' + ',"uuid":"' + settings.uuid + '"}}'
+        body: '{"payload":{"state":{"open":' + open + ',"channel":' + configuredChannel() + ',"uuid":"' + settings.uuid + '"}},"header":{"messageId":"'+payloadData.get('MessageId')+'","method":"SET","from":"http://'+settings.deviceIp+'/config","sign":"'+payloadData.get('Sign')+'","namespace":"Appliance.GarageDoor.State","triggerSrc":"AndroidLocal","timestamp":' + payloadData.get('CurrentTime') + ',"payloadVersion":1' + ',"uuid":"' + settings.uuid + '"}}'
     ])
-        runIn(settings.garageOpenCloseTime, "refresh")
+        scheduleCommandFollowUpPoll(open)
         return hubAction
     } catch (e) {
         log.error("runCmd hit exception ${e} on ${hubAction}")
@@ -95,20 +232,17 @@ def sendCommand(int open) {
 
 
 def refresh() {
-    def currentVersion = device.currentState('version')?.value ? device.currentState('version')?.value.replace(".","").toInteger() : 0
-
-    // Firmware version 3.2.3 and greater require different data for request
-    if (!settings.deviceIp || !settings.uuid || (currentVersion >= 323 && !settings.key) || (currentVersion < 323 && (!settings.messageId || !settings.sign || !settings.timestamp))) {
-        sendEvent(name: 'door', value: 'unknown', isStateChange: false)
-        log.warn('missing setting configuration')
+    if (!hasMinimumConfig()) {
+        warnMissingConfig()
         return
     }
+    def hubAction = null
     try {
-        def payloadData = currentVersion >= 323 ? getSign() : [MessageId: settings.messageId, Sign: settings.sign, CurrentTime: settings.timestamp]
+        def payloadData = payloadSigningData()
 
-        log.info('Refreshing')
+        log.info('Refreshing Meross garage door status')
         
-        def hubAction = new hubitat.device.HubAction([
+        hubAction = new hubitat.device.HubAction([
             method: 'POST',
             path: '/config',
             headers: [
@@ -118,9 +252,11 @@ def refresh() {
             body: '{"payload":{},"header":{"messageId":"'+payloadData.get('MessageId')+'","method":"GET","from":"http://'+settings.deviceIp+'/subscribe","sign":"'+ payloadData.get('Sign') +'","namespace": "Appliance.System.All","triggerSrc":"AndroidLocal","timestamp":' + payloadData.get('CurrentTime') + ',"payloadVersion":1}}'
         ])
         log hubAction
-        return hubAction
+        sendHubCommand(hubAction)
+        def tz = location?.timeZone ?: TimeZone.getTimeZone('UTC')
+        sendEvent(name: 'lastRefresh', value: new Date().format('yyyy-MM-dd HH:mm:ss', tz), isStateChange: true)
     } catch (Exception e) {
-        log.debug "runCmd hit exception ${e} on ${hubAction}"
+        log.debug "refresh hit exception ${e} on ${hubAction}"
     }
 }
 
@@ -152,7 +288,11 @@ def parse(String description) {
     if(body.header.method == "SETACK") return
     
     if (body.payload.all) {
-        def state = body.payload.all.digest.garageDoor[settings.channel.intValue() - 1].open
+        def doors = body.payload.all.digest.garageDoor
+        def idx = configuredChannel()
+        if (idx >= doors.size() && idx > 0) idx = idx - 1
+        if (idx < 0) idx = 0
+        def state = doors[idx].open
         sendEvent(name: 'door', value: state ? 'open' : 'closed')
         sendEvent(name: 'contact', value: state ? 'open' : 'closed')
         sendEvent(name: 'version', value: body.payload.all.system.firmware.version, isStateChange: false)
@@ -170,8 +310,8 @@ def getSign(int stringLength = 16){
     def randomString = new Random().with { (0..stringLength).collect { chars[ nextInt(chars.length() ) ] }.join()}    
     
     int currentTime = new Date().getTime() / 1000
-    messageId = MessageDigest.getInstance("MD5").digest((randomString + currentTime.toString()).bytes).encodeHex().toString()
-    sign = MessageDigest.getInstance("MD5").digest((messageId + settings.key + currentTime.toString()).bytes).encodeHex().toString()
+    def messageId = MessageDigest.getInstance("MD5").digest((randomString + currentTime.toString()).bytes).encodeHex().toString()
+    def sign = MessageDigest.getInstance("MD5").digest((messageId + settings.key + currentTime.toString()).bytes).encodeHex().toString()
     
     def requestData = [
          CurrentTime: currentTime,
